@@ -2,6 +2,7 @@ import os
 
 from setuptools import setup, find_packages
 
+
 def get_scripts(path):
     for name in os.listdir(path):
         yield os.path.join(path, name)
