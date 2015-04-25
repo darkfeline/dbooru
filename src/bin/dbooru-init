@@ -2,33 +2,16 @@
 
 """This script is for initializing a dbooru instance."""
 
-import os
 import sys
 
 from dbooru.backend import DbooruBackend
-
-
-def _touch_dir(path):
-    """Make dir if it doesn't exist."""
-    os.makedirs(path, exist_ok=True)
 
 
 def main():
     """Entry point."""
     root = sys.argv[1]
     backend = DbooruBackend(root)
-    _touch_dir(backend.root)
-    _touch_dir(backend.files_dir)
-    conn = backend.connect_to_db()
-    cur = conn.cursor()
-    cur.execute(
-        '''CREATE TABLE files (fid text)''')
-    cur.execute(
-        '''CREATE TABLE attributes (fid text, key text, val text,
-        PRIMARY KEY (fid, key) ON CONFLICT REPLACE,
-        FORIEGN KEY (fid) REFERENCES files (fid) ON DELETE CASCADE)''')
-    conn.commit()
-    conn.close()
+    backend.init()
 
 if __name__ == '__main__':
     main()

@@ -1,28 +1,20 @@
 """dbooru.fuseop
 
-This module defines FUSE operations.
+This module defines the FUSE operations used by dbooru.
 
 """
 
-import errno
+from collections import namedtuple
 import os
 
 import llfuse
 
+from dbooru.oslib import do_os
 from dbooru.backend import DbooruBackend
+from dbooru.handlers.root import RootInodeHandler
 
-
-def _do_os(func, *args, **kwargs):
-    """Do low level OS call and handle errors.
-
-    This function wraps any raised OSErrors for the FUSE library.  Call
-    anything that could raise an OSError using this!
-
-    """
-    try:
-        return func(*args, **kwargs)
-    except OSError as err:
-        raise llfuse.FUSEError(err.errno)
+FileTabEntry = namedtuple('FileTabEntry', ['handler', 'count'])
+InoTabEntry = namedtuple('InoTabEntry', ['handler', 'count'])
 
 
 class FUSEOp(llfuse.Operations):
@@ -35,15 +27,17 @@ class FUSEOp(llfuse.Operations):
         super().__init__()
         self.root = root
         self.backend = DbooruBackend(root)
-        self.fh_count_table = None
-        self.fh_handler_table = None
-        self.ino_handler_table = None
+        self.fh_table = None
+        self.ino_table = None
 
     def init(self):
         """Set up."""
-        self.fh_count_table = {}
-        self.fh_handler_table = {}
-        self.ino_handler_table = {}
+        self.fh_table = {}
+        # ROOT_INODE isn't detected
+        # pylint: disable=no-member
+        self.ino_table = {
+            llfuse.ROOT_INODE: InoTabEntry(RootInodeHandler(), 1),
+        }
 
     def destroy(self):
         """Tear down."""
@@ -51,12 +45,15 @@ class FUSEOp(llfuse.Operations):
     ###########################################################################
     # General handlers
     def statfs(self):
-        return _do_os(os.statvfs, self.root)
+        return do_os(os.statvfs, self.root)
 
     ###########################################################################
     # File handlers
+    def _get_fh_handler(self, fh):
+        return self.fh_table[fh].handler
+
     def write(self, fh, off, buf):
-        return self.fh_handler_table[fh].write(off, buf)
+        return self._get_fh_handler(fh).write(off, buf)
 
     def flush(self, fh):
         """Called on close()
@@ -65,19 +62,19 @@ class FUSEOp(llfuse.Operations):
         that.
 
         """
-        self.fh_handler_table[fh].flush()
+        self._get_fh_handler(fh).flush()
 
     def fsync(self, fh, datasync):
-        self.fh_handler_table[fh].fsync(datasync)
+        self._get_fh_handler(fh).fsync(datasync)
 
     def fsyncdir(self, fh, datasync):
-        self.fh_handler_table[fh].fsyncdir(datasync)
+        self._get_fh_handler(fh).fsyncdir(datasync)
 
     def read(self, fh, off, size):
-        return self.fh_handler_table[fh].read(off, size)
+        return self._get_fh_handler(fh).read(off, size)
 
     def readdir(self, fh, off):
-        return self.fh_handler_table[fh].readdir(off)
+        return self._get_fh_handler(fh).readdir(off)
 
     def release(self, fh):
         """Finally close fh.
@@ -86,266 +83,94 @@ class FUSEOp(llfuse.Operations):
 
         """
         self._release_with_func(
-            fh, self.fh_handler_table[fh].release)
+            fh, self._get_fh_handler(fh).release)
 
     def releasedir(self, fh):
         self._release_with_func(
-            fh, self.fh_handler_table[fh].releasedir)
+            fh, self._get_fh_handler(fh).releasedir)
 
     def _release_with_func(self, fh, func):
         """Decrement fh count and call function when zero."""
-        self.fh_count_table[fh] -= 1
-        if self.fh_count_table[fh] < 1:
+        entry = self.fh_table[fh]
+        count = entry.count - 1
+        if count < 1:
             func()
-            del self.fh_count_table[fh]
-            del self.fh_handler_table[fh]
+            del self.fh_table[fh]
+        else:
+            self.fh_table[fh] = entry._replace(count=count)
 
     ###########################################################################
     # General inode handlers
     def forget(self, inode_list):
-        raise NotImplementedError
+        for inode, nlookup in inode_list:
+            entry = self.ino_table[inode]
+            count = entry.count - nlookup
+            if count < 1:
+                del self.ino_table[inode]
+            else:
+                self.ino_table[inode] = entry._replace(count=count)
 
     ###########################################################################
     # Inode handlers
+    def _get_ino_handler(self, inode):
+        return self.ino_table[inode].handler
+
     def access(self, inode, mode, ctx):
-        pass
+        return self._get_ino_handler(inode).access(mode, ctx)
 
     def create(self, inode_parent, name, mode, flags, ctx):
-        pass
+        return self._get_ino_handler(inode_parent).create(
+            name, mode, flags, ctx)
 
     def getattr(self, inode):
-        pass
+        return self._get_ino_handler(inode).getattr()
 
     def getxattr(self, inode, name):
-        pass
+        return self._get_ino_handler(inode).getxattr(name)
+
+    def link(self, inode, new_parent_inode, new_name):
+        return self._get_ino_handler(inode).link(new_parent_inode, new_name)
 
     def listxattr(self, inode):
-        pass
+        return self._get_ino_handler(inode).listxattr()
 
     def lookup(self, parent_inode, name):
-        pass
+        return self._get_ino_handler(parent_inode).lookup(name)
 
     def mkdir(self, parent_inode, name, mode, ctx):
-        pass
+        return self._get_ino_handler(parent_inode).mkdir(name, mode, ctx)
 
     def mknod(self, parent_inode, name, mode, rdev, ctx):
-        pass
+        return self._get_ino_handler(parent_inode).mknod(
+            name, mode, rdev, ctx)
 
     def open(self, inode, flags):
-        pass
+        return self._get_ino_handler(inode).open(flags)
 
     def opendir(self, inode):
-        pass
+        return self._get_ino_handler(inode).opendir()
 
     def readlink(self, inode):
-        pass
+        return self._get_ino_handler(inode).readlink()
 
     def removexattr(self, inode, name):
-        pass
+        self._get_ino_handler(inode).removexattr(name)
 
     def rename(self, inode_parent_old, name_old, inode_parent_new, name_new):
-        pass
+        self._get_ino_handler(inode_parent_old).rename(
+            name_old, inode_parent_new, name_new)
 
     def rmdir(self, inode_parent, name):
-        pass
+        self._get_ino_handler(inode_parent).rmdir(name)
 
     def setattr(self, inode, attr):
-        pass
+        self._get_ino_handler(inode).setattr(attr)
 
     def setxattr(self, inode, name, value):
-        pass
+        self._get_ino_handler(inode).setxattr(name, value)
 
     def symlink(self, inode_parent, name, target, ctx):
-        pass
+        return self._get_ino_handler(inode_parent).symlink(name, target, ctx)
 
     def unlink(self, parent_inode, name):
-        pass
-
-
-class BaseFileHandler:
-
-    """Base class that implements the interface for handling operations on file
-    handlers.
-
-    """
-
-    # pylint: disable=unused-argument
-
-    def write(self, off, buf):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def flush(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def fsync(self, datasync):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def fsyncdir(self, datasync):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def read(self, off, size):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def readdir(self, off):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def release(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def releasedir(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-
-class RawFileHandler:
-
-    """File handling for actual files."""
-
-    def __init__(self, fh):
-        self.fh = fh
-
-    def write(self, off, buf):
-        return _do_os(os.pwrite, self.fh, buf, off)
-
-    def flush(self):
-        pass
-
-    def fsync(self, datasync):
-        if datasync:
-            _do_os(os.fdatasync, self.fh)
-        else:
-            _do_os(os.fsync, self.fh)
-
-    fsyncdir = fsync
-
-    def read(self, off, size):
-        return _do_os(os.pread, self.fh, size, off)
-
-    def readdir(self, off):
-        names = _do_os(llfuse.listdir, self.fh)  # pylint: disable=no-member
-        while off < len(names):
-            name = names[off]
-            off += 1
-            yield (name.encode(), _do_os(os.stat, name, dir_fd=self.fh), off)
-
-    def release(self):
-        _do_os(os.close, self.fh)
-
-    releasedir = release
-
-
-class BaseInodeHandler:
-
-    """Base class that implements the interface for handling operations on inodes.
-
-    """
-
-    def access(self, mode, ctx):
-        raise NotImplementedError
-
-    def create(self, name, mode, flags, ctx):
-        raise NotImplementedError
-
-    def getattr(self):
-        raise NotImplementedError
-
-    def getxattr(self, name):
-        raise NotImplementedError
-
-    def listxattr(self):
-        raise NotImplementedError
-
-    def lookup(self, name):
-        raise NotImplementedError
-
-    def mkdir(self, name, mode, ctx):
-        raise NotImplementedError
-
-    def mknod(self, name, mode, rdev, ctx):
-        raise NotImplementedError
-
-    def open(self, flags):
-        raise NotImplementedError
-
-    def opendir(self):
-        raise NotImplementedError
-
-    def readlink(self):
-        raise NotImplementedError
-
-    def removexattr(self, name):
-        raise NotImplementedError
-
-    def rename(self, name_old, inode_parent_new, name_new):
-        raise NotImplementedError
-
-    def rmdir(self, name):
-        raise NotImplementedError
-
-    def setattr(self, attr):
-        raise NotImplementedError
-
-    def setxattr(self, inode, name, value):
-        raise NotImplementedError
-
-    def symlink(self, name, target, ctx):
-        raise NotImplementedError
-
-    def unlink(self, name):
-        raise NotImplementedError
-
-
-class RawInodeHandler:
-
-    def access(self, mode, ctx):
-        raise NotImplementedError
-
-    def create(self, name, mode, flags, ctx):
-        raise NotImplementedError
-
-    def getattr(self):
-        raise NotImplementedError
-
-    def getxattr(self, name):
-        raise NotImplementedError
-
-    def listxattr(self):
-        raise NotImplementedError
-
-    def lookup(self, name):
-        raise NotImplementedError
-
-    def mkdir(self, name, mode, ctx):
-        raise NotImplementedError
-
-    def mknod(self, name, mode, rdev, ctx):
-        raise NotImplementedError
-
-    def open(self, flags):
-        raise NotImplementedError
-
-    def opendir(self):
-        raise NotImplementedError
-
-    def readlink(self):
-        raise NotImplementedError
-
-    def removexattr(self, name):
-        raise NotImplementedError
-
-    def rename(self, name_old, inode_parent_new, name_new):
-        raise NotImplementedError
-
-    def rmdir(self, name):
-        raise NotImplementedError
-
-    def setattr(self, attr):
-        raise NotImplementedError
-
-    def setxattr(self, inode, name, value):
-        raise NotImplementedError
-
-    def symlink(self, name, target, ctx):
-        raise NotImplementedError
-
-    def unlink(self, name):
-        raise NotImplementedError
+        return self._get_ino_handler(parent_inode).unlink(name)

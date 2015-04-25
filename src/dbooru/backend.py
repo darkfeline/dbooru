@@ -1,6 +1,7 @@
-"""dbooru.resource
+"""dbooru.backend
 
-This module contains a class for easy resource location.
+This module implements the low level interface for interacting with dbooru's
+file and metadata storage.
 
 """
 
@@ -15,6 +16,11 @@ class DbooruBackend:
     """Backend responsible for all interaction with files and metadata."""
 
     def __init__(self, root):
+        """
+        Args:
+            root: Path to dbooru directory.
+
+        """
         self.root = root
 
     @property
@@ -25,17 +31,21 @@ class DbooruBackend:
     def db_file(self):
         return os.path.join(self.root, 'dbooru.db')
 
+    def fid_path(self, fid):
+        """Return path to file with given fid."""
+        return os.path.join(self.files_dir, fid)
+
     def create(self):
         """Create a file."""
         return _FileWrapper(self)
 
     def stat(self, fid):
         """Return a stored file's stat structure."""
-        return os.stat(os.path.join(self.files_dir, fid))
+        return os.stat(self.fid_path(fid))
 
     def delete(self, fid):
         """Delete stored file."""
-        os.unlink(os.path.join(self.files_dir, fid))
+        os.unlink(self.fid_path(fid))
         conn = self.connect_to_db()
         cur = conn.cursor()
         cur.execute('DELETE FROM files WHERE fid=?', fid)
@@ -46,6 +56,26 @@ class DbooruBackend:
         """Connect to metadata database."""
         return sqlite3.connect(self.db_file)
 
+    def init(self):
+        """Initialize dbooru instance."""
+        _touch_dir(self.root)
+        _touch_dir(self.files_dir)
+        conn = self.connect_to_db()
+        cur = conn.cursor()
+        cur.execute(
+            '''CREATE TABLE files (fid text)''')
+        cur.execute(
+            '''CREATE TABLE attributes (fid text, key text, val text,
+            PRIMARY KEY (fid, key) ON CONFLICT REPLACE,
+            FORIEGN KEY (fid) REFERENCES files (fid) ON DELETE CASCADE)''')
+        conn.commit()
+        conn.close()
+
+
+def _touch_dir(path):
+    """Make dir if it doesn't exist."""
+    os.makedirs(path, exist_ok=True)
+
 
 class _FileWrapper:
 
@@ -53,7 +83,7 @@ class _FileWrapper:
 
     When an instance is created, a temporary file descriptor is made, which can
     be accessed using the fd attribute.  This file descriptor can be used to
-    write the content of the file.  When the file is completely written, it is
+    write the contents of the file.  When the file is completely written, it is
     finalized by calling the close() method, which will close the file
     descriptor, calculate its hash to use as its fid, then move the temporary
     file to its final location.
@@ -61,15 +91,15 @@ class _FileWrapper:
     This class can be used as a context manager, in which case it returns a
     binary writable file object:
 
-        with _FileWrapper(root) as file:
+        with _FileWrapper(backend) as file:
             file.write(b'This is some data.')
 
     """
 
     _PROCESS_LENGTH = 10 * (2 ** 20)  # 10 MiB
 
-    def __init__(self, root):
-        self._root = root
+    def __init__(self, backend):
+        self._backend = backend
         self.fd, self._path = tempfile.mkstemp()
         self._file = None
 
@@ -93,9 +123,9 @@ class _FileWrapper:
                     break
                 hasher.update(data)
         fid = hasher.hexdigest()
-        os.rename(self._path, os.path.join(self._root.files_dir, fid))
+        os.rename(self._path, self._backend.fid_path(fid))
         # Write necessary metadata for new file.
-        conn = self._root.connect_to_db()
+        conn = self._backend.connect_to_db()
         cur = conn.cursor()
         cur.execute('INSERT INTO files VALUES (?)', fid)
         conn.commit()
