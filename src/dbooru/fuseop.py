@@ -34,6 +34,31 @@ FileTabEntry = namedtuple('FileTabEntry', ['handler', 'count'])
 InoTabEntry = namedtuple('InoTabEntry', ['handler', 'count'])
 
 
+class _HandleGen:
+
+    """File handle generator."""
+
+    _LIMIT = 2
+
+    def __init__(self):
+        self._head = self._LIMIT
+        self._unused = []
+
+    def __next__(self):
+        if self._unused:
+            return self._unused.pop()
+        else:
+            self._head += 1
+            return self._head
+
+    def forget(self, fh):
+        if fh > self._head or fh <= self._LIMIT:
+            raise ValueError('{} not issued.'.format(fh))
+        elif fh in self._unused:
+            raise ValueError('{} already forgotten.'.format(fh))
+        self._unused.append(fh)
+
+
 class FUSEOp(llfuse.Operations):
     """dbooru implementation of FUSE operations."""
 
@@ -42,19 +67,21 @@ class FUSEOp(llfuse.Operations):
     def __init__(self, root):
         """Initialize handler."""
         super().__init__()
-        self.root = root
-        self.backend = DbooruBackend(root)
-        self.fh_table = None
-        self.ino_table = None
+        self._root = root
+        self._backend = DbooruBackend(root)
+        self._fh_table = None
+        self._ino_table = None
+        self._fh_gen = None
 
     def init(self):
         """Set up."""
-        self.fh_table = {}
+        self._fh_table = {}
         # ROOT_INODE isn't detected
         # pylint: disable=no-member
-        self.ino_table = {
-            llfuse.ROOT_INODE: InoTabEntry(RootInodeHandler(self.root), 1),
+        self._ino_table = {
+            llfuse.ROOT_INODE: InoTabEntry(RootInodeHandler(self._root), 1),
         }
+        self._fh_gen = _HandleGen()
 
     def destroy(self):
         """Tear down."""
@@ -62,15 +89,16 @@ class FUSEOp(llfuse.Operations):
     ###########################################################################
     # General handlers
     def statfs(self):
-        return do_os(os.statvfs, self.root)
+        return do_os(os.statvfs, self._root)
 
     ###########################################################################
     # File handlers
-    def _get_fh_handler(self, fh):
-        return self.fh_table[fh].handler
+    def _get_fh(self, fh):
+        """Return handler for given file handle."""
+        return self._fh_table[fh].handler
 
     def write(self, fh, off, buf):
-        return self._get_fh_handler(fh).write(off, buf)
+        return self._get_fh(fh).write(off, buf)
 
     def flush(self, fh):
         """Called on close()
@@ -79,19 +107,19 @@ class FUSEOp(llfuse.Operations):
         that.
 
         """
-        self._get_fh_handler(fh).flush()
+        self._get_fh(fh).flush()
 
     def fsync(self, fh, datasync):
-        self._get_fh_handler(fh).fsync(datasync)
+        self._get_fh(fh).fsync(datasync)
 
     def fsyncdir(self, fh, datasync):
-        self._get_fh_handler(fh).fsyncdir(datasync)
+        self._get_fh(fh).fsyncdir(datasync)
 
     def read(self, fh, off, size):
-        return self._get_fh_handler(fh).read(off, size)
+        return self._get_fh(fh).read(off, size)
 
     def readdir(self, fh, off):
-        return self._get_fh_handler(fh).readdir(off)
+        return self._get_fh(fh).readdir(off)
 
     def release(self, fh):
         """Finally close fh.
@@ -100,94 +128,112 @@ class FUSEOp(llfuse.Operations):
 
         """
         self._release_with_func(
-            fh, self._get_fh_handler(fh).release)
+            fh, self._get_fh(fh).release)
 
     def releasedir(self, fh):
         self._release_with_func(
-            fh, self._get_fh_handler(fh).releasedir)
+            fh, self._get_fh(fh).releasedir)
 
     def _release_with_func(self, fh, func):
         """Decrement fh count and call function when zero."""
-        entry = self.fh_table[fh]
+        entry = self._fh_table[fh]
         count = entry.count - 1
         if count < 1:
             func()
-            del self.fh_table[fh]
+            del self._fh_table[fh]
+            self._fh_gen.forget(fh)
         else:
-            self.fh_table[fh] = entry._replace(count=count)
+            self._fh_table[fh] = entry._replace(count=count)
 
     ###########################################################################
     # General inode handlers
     def forget(self, inode_list):
         for inode, nlookup in inode_list:
-            entry = self.ino_table[inode]
+            entry = self._ino_table[inode]
             count = entry.count - nlookup
             if count < 1:
-                del self.ino_table[inode]
+                del self._ino_table[inode]
             else:
-                self.ino_table[inode] = entry._replace(count=count)
+                self._ino_table[inode] = entry._replace(count=count)
 
     ###########################################################################
     # Inode handlers
-    def _get_ino_handler(self, inode):
-        return self.ino_table[inode].handler
+    def _get_ino(self, inode):
+        """Get handler for inode."""
+        return self._ino_table[inode].handler
+
+    def _set_ino(self, handler):
+        """Set handler in inode table."""
+        self._ino_table[handler.attr.st_ino] = handler
+
+    def _set_fh(self, handler):
+        """Set handler in file handle table."""
+        fh = next(self._fh_gen)
+        self._fh_table[fh] = handler
+        return fh
 
     def access(self, inode, mode, ctx):
-        return self._get_ino_handler(inode).access(mode, ctx)
+        return self._get_ino(inode).access(mode, ctx)
 
     def create(self, inode_parent, name, mode, flags, ctx):
-        return self._get_ino_handler(inode_parent).create(
+        return self._get_ino(inode_parent).create(
             name, mode, flags, ctx)
 
     def getattr(self, inode):
-        return self._get_ino_handler(inode).getattr()
+        return self._get_ino(inode).getattr()
 
     def getxattr(self, inode, name):
-        return self._get_ino_handler(inode).getxattr(name)
+        return self._get_ino(inode).getxattr(name)
 
     def link(self, inode, new_parent_inode, new_name):
-        return self._get_ino_handler(inode).link(new_parent_inode, new_name)
+        return self._get_ino(inode).link(new_parent_inode, new_name)
 
     def listxattr(self, inode):
-        return self._get_ino_handler(inode).listxattr()
+        return self._get_ino(inode).listxattr()
 
     def lookup(self, parent_inode, name):
-        return self._get_ino_handler(parent_inode).lookup(name)
+        handler = self._get_ino(parent_inode).lookup(name)
+        self._set_ino(handler)
+        return handler.attr
 
     def mkdir(self, parent_inode, name, mode, ctx):
-        return self._get_ino_handler(parent_inode).mkdir(name, mode, ctx)
+        return self._get_ino(parent_inode).mkdir(name, mode, ctx)
 
     def mknod(self, parent_inode, name, mode, rdev, ctx):
-        return self._get_ino_handler(parent_inode).mknod(
+        return self._get_ino(parent_inode).mknod(
             name, mode, rdev, ctx)
 
     def open(self, inode, flags):
-        return self._get_ino_handler(inode).open(flags)
+        handler = self._get_ino(inode).open(flags)
+        fh = self._set_fh(handler)
+        return fh
 
     def opendir(self, inode):
-        return self._get_ino_handler(inode).opendir()
+        handler = self._get_ino(inode).opendir()
+        fh = self._set_fh(handler)
+        return fh
 
     def readlink(self, inode):
-        return self._get_ino_handler(inode).readlink()
+        return self._get_ino(inode).readlink()
 
     def removexattr(self, inode, name):
-        self._get_ino_handler(inode).removexattr(name)
+        self._get_ino(inode).removexattr(name)
 
     def rename(self, inode_parent_old, name_old, inode_parent_new, name_new):
-        self._get_ino_handler(inode_parent_old).rename(
+        self._get_ino(inode_parent_old).rename(
             name_old, inode_parent_new, name_new)
 
     def rmdir(self, inode_parent, name):
-        self._get_ino_handler(inode_parent).rmdir(name)
+        self._get_ino(inode_parent).rmdir(name)
 
     def setattr(self, inode, attr):
-        self._get_ino_handler(inode).setattr(attr)
+        self._get_ino(inode).setattr(attr)
 
     def setxattr(self, inode, name, value):
-        self._get_ino_handler(inode).setxattr(name, value)
+        self._get_ino(inode).setxattr(name, value)
 
     def symlink(self, inode_parent, name, target, ctx):
-        return self._get_ino_handler(inode_parent).symlink(name, target, ctx)
+        return self._get_ino(inode_parent).symlink(name, target, ctx)
 
     def unlink(self, parent_inode, name):
-        return self._get_ino_handler(parent_inode).unlink(name)
+        return self._get_ino(parent_inode).unlink(name)

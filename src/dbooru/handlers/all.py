@@ -31,17 +31,15 @@ import llfuse
 from dbooru.oslib import do_os
 
 from .base import BaseInodeHandler
-from .base import BaseFileHandler
-from .base import BaseLookupDir
+from .base import BaseDir
 
 
-class RootInodeHandler(BaseFileHandler, BaseInodeHandler, BaseLookupDir):
+class RootInodeHandler(BaseInodeHandler, BaseDir):
 
     def __init__(self, root):
         self._root = root
         attr = self._make_attr()
-        lookup_map = {}
-        super().__init__(attr=attr, lookup_map=lookup_map)
+        super().__init__(attr=attr)
 
     def _make_attr(self):
         statvfs = do_os(os.statvfs, self._root)
@@ -76,29 +74,8 @@ class RootInodeHandler(BaseFileHandler, BaseInodeHandler, BaseLookupDir):
     def getattr(self):
         return self.attr
 
+    def lookup(self, name):
+        raise NotImplementedError
+
     def opendir(self):
-        return self
-
-    def write(self, off, buf):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def flush(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def fsync(self, datasync):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def fsyncdir(self, datasync):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def read(self, off, size):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def readdir(self, off):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def release(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
-
-    def releasedir(self):
-        raise llfuse.FUSEError(errno.ENOSYS)
+        raise NotImplementedError

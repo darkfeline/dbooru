@@ -125,3 +125,44 @@ class BaseInodeHandler:
 
     def unlink(self, name):
         raise llfuse.FUSEError(errno.ENOSYS)
+
+
+class BaseFile:
+
+    """Base class for virtual files.  Has attr attribute."""
+
+    def __init__(self, *args, attr, **kwargs):
+        self.attr = attr
+        super().__init__(*args, **kwargs)
+
+
+class BaseDir(BaseFile):
+
+    """Base class for virtual directories."""
+
+    def __init__(self, *args, parent=None, **kwargs):
+        self._parent = parent
+        super().__init__(*args, **kwargs)
+
+    @property
+    def parent_attr(self):
+        return self._parent.attr
+
+
+class BaseLookupDir(BaseDir):
+
+    """Base class that implements basic virtual inode lookup."""
+
+    def __init__(self, *args, lookup_map, **kwargs):
+        self._lookup_map = lookup_map
+        super().__init__(*args, **kwargs)
+
+    def lookup(self, name):
+        if name == '.':
+            return self.attr
+        elif name == '..':
+            return self.parent_attr
+        elif name in self._lookup_map:
+            return self._lookup_map[name]
+        else:
+            return super().lookup(name)
